@@ -17,9 +17,38 @@ Base.cconvert(::Type{Ptr{Cvoid}}, x::CallbackData) = x
 Base.unsafe_convert(::Type{Ptr{Cvoid}}, x::CallbackData) = x.ptr::Ptr{Cvoid}
 Base.broadcastable(x::CallbackData) = Ref(x)
 
-mutable struct _CallbackUserData
+mutable struct _MOICallbackData{F}
+    callback::F
+end
+
+function _moi_callback_entry(data::_MOICallbackData, argument)
+    # Do not unwind exceptions across the C ABI. Return the exception to the
+    # Julia caller, including unusual values such as throw(nothing).
+    try
+        data.callback(argument::CallbackData)
+        return nothing
+    catch err
+        return Some(err)
+    end
+end
+
+function _CompiledCallback(f::F) where {F<:Function}
+    data = _MOICallbackData(f)
+    entry = @cfunction(_moi_callback_entry, Any, (Ref{_MOICallbackData{F}}, Any))
+    return _CompiledCallback(data, entry)
+end
+
+function (callback::_CompiledCallback)(argument::CallbackData)
+    result = ccall(callback.entry, Any, (Any, Any), callback.data, argument)
+    if result !== nothing
+        throw((result::Some).value)
+    end
+    return nothing
+end
+
+mutable struct _CallbackUserData{F}
     model::Optimizer
-    callback::Function
+    callback::F
 end
 Base.cconvert(::Type{Ptr{Cvoid}}, x::_CallbackUserData) = x
 function Base.unsafe_convert(::Type{Ptr{Cvoid}}, x::_CallbackUserData)
@@ -30,11 +59,10 @@ function _gurobi_callback_wrapper(
     p_model::Ptr{Cvoid},
     cb_data::Ptr{Cvoid},
     cb_where::Cint,
-    p_user_data::Ptr{Cvoid},
+    user_data::_CallbackUserData,
 )
     try
         reenable_sigint() do
-            user_data = unsafe_pointer_to_objref(p_user_data)::_CallbackUserData
             user_data.callback(
                 CallbackData(user_data.model, cb_data, cb_where),
                 cb_where,
@@ -48,6 +76,16 @@ function _gurobi_callback_wrapper(
         end
     end
     return Cint(0)
+end
+
+function _callback_pointer(::_CallbackUserData{F}) where {F}
+    # Ref to a mutable Julia object has the same pointer ABI as Gurobi's void*.
+    # The concrete userdata type selects a precompiled callback specialization.
+    return @cfunction(
+        _gurobi_callback_wrapper,
+        Cint,
+        (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Ref{_CallbackUserData{F}}),
+    )
 end
 
 """
@@ -73,11 +111,6 @@ struct CallbackFunction <: MOI.AbstractCallback
 end
 
 function MOI.set(model::Optimizer, attr::CallbackFunction, f::Function)
-    grb_callback = @cfunction(
-        _gurobi_callback_wrapper,
-        Cint,
-        (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Ptr{Cvoid})
-    )
     user_data = _CallbackUserData(
         model,
         (cb_data, cb_where) -> begin
@@ -87,6 +120,7 @@ function MOI.set(model::Optimizer, attr::CallbackFunction, f::Function)
             return
         end,
     )
+    grb_callback = _callback_pointer(user_data)
     if _GUROBI_VERSION >= v"13"
         ret = GRBsetcallbackfuncadv(model, grb_callback, user_data, attr.wheres)
         _check_ret(model, ret)
@@ -208,7 +242,7 @@ end
 
 function MOI.set(model::Optimizer, ::MOI.LazyConstraintCallback, cb::Function)
     MOI.set(model, MOI.RawOptimizerAttribute("LazyConstraints"), 1)
-    model.lazy_callback = cb
+    model.lazy_callback = _CompiledCallback(cb)
     return
 end
 
@@ -261,7 +295,7 @@ MOI.supports(::Optimizer, ::MOI.LazyConstraint{CallbackData}) = true
 # ==============================================================================
 
 function MOI.set(model::Optimizer, ::MOI.UserCutCallback, cb::Function)
-    model.user_cut_callback = cb
+    model.user_cut_callback = _CompiledCallback(cb)
     return
 end
 
@@ -314,7 +348,7 @@ MOI.supports(::Optimizer, ::MOI.UserCut{CallbackData}) = true
 # ==============================================================================
 
 function MOI.set(model::Optimizer, ::MOI.HeuristicCallback, cb::Function)
-    model.heuristic_callback = cb
+    model.heuristic_callback = _CompiledCallback(cb)
     return
 end
 

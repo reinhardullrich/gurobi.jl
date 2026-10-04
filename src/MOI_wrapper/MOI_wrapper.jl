@@ -220,6 +220,11 @@ Base.unsafe_convert(::Type{Ptr{Cvoid}}, env::Env) = env.ptr_env::Ptr{Cvoid}
 const _HASH = CleverDicts.key_to_index
 const _INVERSE_HASH = x -> CleverDicts.index_to_key(MOI.VariableIndex, x)
 
+struct _CompiledCallback
+    data::Any
+    entry::Ptr{Cvoid}
+end
+
 """
     Optimizer(
         env::Union{Nothing,Env} = nothing;
@@ -255,7 +260,7 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     # on `MOI.empty!`.
     env::Union{Nothing,Env}
     # The current user-provided parameters for the model.
-    params::Dict{String,Any}
+    params::Dict{String,Union{Cint,Cdouble,String}}
 
     # The next fields are used to cleverly manage calls to `_update_if_necessary`.
     # `attribute_change` is to record whether a change has been made to the
@@ -356,9 +361,9 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     callback_variable_primal::Vector{Float64}
     has_generic_callback::Bool
     callback_state::_CallbackState
-    lazy_callback::Union{Nothing,Function}
-    user_cut_callback::Union{Nothing,Function}
-    heuristic_callback::Union{Nothing,Function}
+    lazy_callback::Union{Nothing,_CompiledCallback}
+    user_cut_callback::Union{Nothing,_CompiledCallback}
+    heuristic_callback::Union{Nothing,_CompiledCallback}
     generic_callback::Any
 
     conflict::Cint
@@ -371,7 +376,7 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
         model.inner = C_NULL
         model.env = env === nothing ? Env() : env
         model.enable_interrupts = enable_interrupts
-        model.params = Dict{String,Any}()
+        model.params = Dict{String,Union{Cint,Cdouble,String}}()
         model.silent = false
         model.variable_info =
             CleverDicts.CleverDict{MOI.VariableIndex,_VariableInfo}(
@@ -710,25 +715,30 @@ MOI.supports(::Optimizer, ::MOI.ConstraintDualStart) = false
 function MOI.set(model::Optimizer, raw::MOI.RawOptimizerAttribute, value)
     env = GRBgetenv(model)
     param = raw.name
-    model.params[param] = value
-    _set_param(env, param, value)
+    # Retain the native parameter type for statically compiled replay in empty!.
+    # Update the cache only after Gurobi accepts the value.
+    model.params[param] = _set_param(env, param, value)
     return
 end
 
 function _set_param(env, param::String, value)
     param_type = GRBgetparamtype(env, param)
-    ret = if param_type == -1
+    if param_type == -1
         throw(MOI.UnsupportedAttribute(MOI.RawOptimizerAttribute(param)))
     elseif param_type == 1
-        GRBsetintparam(env, param, value)
+        converted = convert(Cint, value)
+        _check_ret(env, GRBsetintparam(env, param, converted))
+        return converted
     elseif param_type == 2
-        GRBsetdblparam(env, param, value)
+        converted = convert(Cdouble, value)
+        _check_ret(env, GRBsetdblparam(env, param, converted))
+        return converted
     else
         @assert param_type == 3
-        GRBsetstrparam(env, param, value)
+        converted = String(value)
+        _check_ret(env, GRBsetstrparam(env, param, converted))
+        return converted
     end
-    _check_ret(env, ret)
-    return
 end
 
 function MOI.get(model::Optimizer, raw::MOI.RawOptimizerAttribute)
@@ -3047,7 +3057,7 @@ function _has_primal_ray(model::Optimizer)
 end
 
 # A deprecation added in Gurobi 13
-_XN = ifelse(_GUROBI_VERSION >= v"13", "PoolNX", "Xn")
+const _XN = ifelse(_GUROBI_VERSION >= v"13", "PoolNX", "Xn")
 
 function MOI.get(
     model::Optimizer,
@@ -3294,13 +3304,32 @@ function MOI.get(
 end
 
 # A deprecation added in Gurobi 13
-_POOLOBJVAL = ifelse(_GUROBI_VERSION >= v"13", "PoolNObjVal", "PoolObjVal")
+const _POOLOBJVAL = ifelse(_GUROBI_VERSION >= v"13", "PoolNObjVal", "PoolObjVal")
+
+# Keep every objective type supported by this adapter visible to the compiler.
+# The shared MOI evaluator still performs the same ray/constant calculation.
+function _ray_objective_value(model::Optimizer, attr::MOI.ObjectiveValue)
+    if model.objective_type == _SINGLE_VARIABLE
+        f = MOI.get(model, MOI.ObjectiveFunction{MOI.VariableIndex}())
+        return MOI.Utilities.get_fallback(model, attr, f)
+    elseif model.objective_type == _SCALAR_AFFINE
+        f = MOI.get(model, MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}())
+        return MOI.Utilities.get_fallback(model, attr, f)
+    elseif model.objective_type == _SCALAR_QUADRATIC
+        f = MOI.get(model, MOI.ObjectiveFunction{MOI.ScalarQuadraticFunction{Float64}}())
+        return MOI.Utilities.get_fallback(model, attr, f)
+    else
+        @assert model.objective_type == _VECTOR_AFFINE
+        f = MOI.get(model, MOI.ObjectiveFunction{MOI.VectorAffineFunction{Float64}}())
+        return MOI.Utilities.get_fallback(model, attr, f)
+    end
+end
 
 function MOI.get(model::Optimizer, attr::MOI.ObjectiveValue)
     _throw_if_optimize_in_progress(model, attr)
     MOI.check_result_index_bounds(model, attr)
     if model.has_unbounded_ray
-        return MOI.Utilities.get_fallback(model, attr)
+        return _ray_objective_value(model, attr)
     end
     if attr.result_index > 1
         MOI.set(

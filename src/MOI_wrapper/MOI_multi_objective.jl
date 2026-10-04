@@ -123,7 +123,7 @@ struct MultiObjectiveValue <: MOI.AbstractModelAttribute
 end
 
 function MOI.get(model::Optimizer, attr::MultiObjectiveValue)
-    return MOI.get(model, MultiObjectiveAttribute(attr.index, "ObjNVal"))
+    return MOI.get(model, MultiObjectiveAttribute(attr.index, "ObjNVal"))::Float64
 end
 
 function MOI.set(
@@ -152,7 +152,7 @@ function MOI.get(
         _check_ret(env, ret)
         push!(f, _get_affine_objective(model; is_multiobjective = true))
     end
-    return MOI.Utilities.operate(vcat, Float64, f...)
+    return MOI.Utilities.vectorize(f)
 end
 
 function MOI.supports(
